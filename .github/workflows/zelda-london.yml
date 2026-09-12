@@ -1,0 +1,157 @@
+name: Zelda Concert Ticket Watch
+
+on:
+  schedule:
+    # Every 10 minutes, offset from the top of the hour.
+    - cron: "3,13,23,33,43,53 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_notification:
+        description: "Send a Discord test notification"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Send test notification
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_notification }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          url = os.environ["DISCORD_WEBHOOK_URL"]
+          payload = {
+              "content": "ðŸ§ª **Zelda London ticket monitor test**\nGitHub Actions â†’ Discord is working.\nhttps://zelda.gameconcerts.com/"
+          }
+          req = urllib.request.Request(
+              url,
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req) as r:
+              print("Discord status:", r.status)
+          PY
+
+      - name: Check London ticket status
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test_notification) }}
+        id: check
+        run: |
+          python3 - <<'PY'
+          import html
+          import re
+          import urllib.request
+          import os
+
+          URL = "https://zelda.gameconcerts.com/"
+
+          req = urllib.request.Request(
+              URL,
+              headers={"User-Agent": "Mozilla/5.0 ZeldaLondonTicketWatch/1.0"},
+          )
+          with urllib.request.urlopen(req, timeout=30) as r:
+              raw = r.read().decode("utf-8", errors="replace")
+
+          # Strip scripts/styles/tags and normalize visible text.
+          raw = re.sub(r"(?is)<script.*?</script>", " ", raw)
+          raw = re.sub(r"(?is)<style.*?</style>", " ", raw)
+          text = re.sub(r"(?s)<[^>]+>", " ", raw)
+          text = html.unescape(text)
+          text = re.sub(r"\s+", " ", text).strip()
+
+          # Extract only the two London listings.
+          m1 = re.search(
+              r"UK\s+LONDON\s+3 APR 2027\b(.*?)(?=UK\s+LONDON\s+4 APR 2027\b)",
+              text,
+              re.I,
+          )
+          m2 = re.search(
+              r"UK\s+LONDON\s+4 APR 2027\b(.*?)(?=AUS\s+MELBOURNE\b)",
+              text,
+              re.I,
+          )
+
+          if not m1 or not m2:
+              raise SystemExit(
+                  "Could not find both London concert listings. "
+                  "The page structure/text may have changed."
+              )
+
+          london_3 = "LONDON 3 APR 2027 " + m1.group(1).strip()
+          london_4 = "LONDON 4 APR 2027 " + m2.group(1).strip()
+          state = london_3 + "\n" + london_4 + "\n"
+
+          with open("london-state.txt", "w", encoding="utf-8") as f:
+              f.write(state)
+
+          all_tba = (
+              "on sale tba" in london_3.lower()
+              and "on sale tba" in london_4.lower()
+          )
+
+          print(state)
+          print("Both London dates still TBA:", all_tba)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"all_tba={'true' if all_tba else 'false'}\n")
+          PY
+
+      - name: Restore alert marker
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test_notification) }}
+        id: alert_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .alert-marker
+          key: zelda-london-alert-${{ hashFiles('london-state.txt') }}
+
+      - name: Send London ticket alert
+        if: ${{ steps.check.outputs.all_tba == 'false' && steps.alert_cache.outputs.cache-hit != 'true' }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          with open("london-state.txt", encoding="utf-8") as f:
+              state = f.read().strip()
+
+          message = (
+              "ðŸš¨ **ZELDA LONDON TICKET UPDATE**\n"
+              "At least one Royal Albert Hall performance no longer says `on sale TBA`.\n\n"
+              f"{state}\n\n"
+              "Check immediately: https://zelda.gameconcerts.com/"
+          )
+
+          req = urllib.request.Request(
+              os.environ["DISCORD_WEBHOOK_URL"],
+              data=json.dumps({"content": message}).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req) as r:
+              print("Discord status:", r.status)
+          PY
+
+      - name: Create alert marker
+        if: ${{ steps.check.outputs.all_tba == 'false' && steps.alert_cache.outputs.cache-hit != 'true' }}
+        run: |
+          mkdir -p .alert-marker
+          date -u > .alert-marker/sent-at.txt
+
+      - name: Save alert marker
+        if: ${{ steps.check.outputs.all_tba == 'false' && steps.alert_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .alert-marker
+          key: zelda-london-alert-${{ hashFiles('london-state.txt') }}
+          
